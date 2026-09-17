@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Type
 
 from pydantic import BaseModel
-from together import Together
 
 from autoscilab.benchmarking import ResponseCache, safe_endpoint
 
@@ -198,6 +197,14 @@ class LLMClient:
         else:
             self._oa_client = None
             # For Together, keep using TOGETHER_API_KEY (or explicit api_key).
+            try:
+                from together import Together  # type: ignore
+            except ImportError as exc:
+                raise ImportError(
+                    "The 'together' package is required only for Together-hosted "
+                    "models. Install it with `python -m pip install together`, or "
+                    "set --main-url/OPENAI_BASE_URL for an OpenAI-compatible server."
+                ) from exc
             self._tg_client = Together(
                 api_key=api_key or os.environ.get("TOGETHER_API_KEY", ""),
                 timeout=self._request_timeout,
