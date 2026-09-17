@@ -693,6 +693,7 @@ def run_llm_pipeline(
         max_experiments_per_iter=max_experiments_per_iter,
         llm_model=model,
         results_dir=results_dir or Path("results/chembench_comparison"),
+        llm_cache_path=(results_dir / "llm_responses.json") if results_dir else None,
         policy="families_v3",
         use_domain_tags=use_domain_tags,
         hypothesis_grammar_source=hypothesis_grammar_source,

@@ -11,10 +11,13 @@ import os
 import random
 import re
 import time
+from pathlib import Path
 from typing import Type
 
 from pydantic import BaseModel
 from together import Together
+
+from autoscilab.benchmarking import ResponseCache, safe_endpoint
 
 DEFAULT_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 
@@ -146,12 +149,16 @@ class LLMClient:
         base_url: str | None = None,
         max_completion_tokens: int = 8192,
         temperature: float | None = None,
+        cache_path: Path | None = None,
     ):
         self._model = model
         self._max_retries = max_retries
         self._max_completion_tokens = max_completion_tokens
         self._temperature = temperature
         self._is_thinking = _is_thinking_model(model)
+        self._base_url = safe_endpoint(base_url)
+        self._cache = ResponseCache(cache_path)
+        self._request_timeout = float(os.environ.get("LLM_REQUEST_TIMEOUT_SECONDS", "1800"))
 
         # If a custom base_url is provided (e.g. local vLLM/transformers server),
         # always use an OpenAI-compatible client pointing there.
@@ -160,6 +167,8 @@ class LLMClient:
             self._oa_client = OpenAI(
                 base_url=base_url,
                 api_key=_resolve_openai_compatible_key(base_url, api_key),
+                timeout=self._request_timeout,
+                max_retries=0,
             )
             self._tg_client = None
             self._use_openai = True
@@ -180,15 +189,41 @@ class LLMClient:
 
             # For OpenAI, always prefer OPENAI_API_KEY from the environment.
             oa_key = os.environ.get("OPENAI_API_KEY", "")
-            self._oa_client = OpenAI(api_key=oa_key)
+            self._oa_client = OpenAI(
+                api_key=oa_key,
+                timeout=self._request_timeout,
+                max_retries=0,
+            )
             self._tg_client = None
         else:
             self._oa_client = None
             # For Together, keep using TOGETHER_API_KEY (or explicit api_key).
             self._tg_client = Together(
                 api_key=api_key or os.environ.get("TOGETHER_API_KEY", ""),
-                timeout=360,  # Qwen3-235B thinking blocks can take 2-3 min
+                timeout=self._request_timeout,
             )
+
+    def _cache_lookup(
+        self,
+        *,
+        kind: str,
+        messages: list[dict],
+        max_tokens: int,
+        tool_name: str | None = None,
+    ) -> tuple[str, int, str | None]:
+        key = self._cache.fingerprint(
+            {
+                "kind": kind,
+                "model": self._model,
+                "base_url": self._base_url,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": self._temperature,
+                "tool_name": tool_name,
+            }
+        )
+        position, value = self._cache.lookup(key)
+        return key, position, value
 
     def complete(
         self,
@@ -199,6 +234,11 @@ class LLMClient:
         """Basic completion — returns raw text."""
         _max = max_tokens if max_tokens is not None else self._max_completion_tokens
         full_messages = [{"role": "system", "content": system}] + messages
+        cache_key, cache_position, cached = self._cache_lookup(
+            kind="text", messages=full_messages, max_tokens=_max
+        )
+        if cached is not None:
+            return cached
 
         last_err: Exception | None = None
         for attempt in range(self._max_retries):
@@ -235,6 +275,7 @@ class LLMClient:
         raw = response.choices[0].message.content or ""
         # Strip <think>...</think> blocks (Qwen3 reasoning model)
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        self._cache.store(cache_key, cache_position, raw)
         return raw
 
     def complete_json(
@@ -273,6 +314,20 @@ class LLMClient:
         # Thinking models need more tokens (reasoning chain + JSON answer).
         _base_max = max_tokens if max_tokens is not None else self._max_completion_tokens
         effective_max_tokens = 32768 if self._is_thinking else _base_max
+
+        cache_key, cache_position, cached = self._cache_lookup(
+            kind="json",
+            messages=full_messages,
+            max_tokens=effective_max_tokens,
+            tool_name=tool_name,
+        )
+        if cached is not None:
+            try:
+                return schema.model_validate(_normalize_bounds_payload(json.loads(cached)))
+            except Exception:
+                # A schema/code change may invalidate an old cache entry. Fetch a
+                # fresh response and replace this exact occurrence.
+                pass
 
         for attempt in range(self._max_retries):
             try:
@@ -363,7 +418,9 @@ class LLMClient:
                             )
                         }]
                     continue
-                return schema.model_validate(data)
+                validated = schema.model_validate(data)
+                self._cache.store(cache_key, cache_position, raw)
+                return validated
             except Exception as e:
                 if attempt == self._max_retries - 1:
                     raise RuntimeError(

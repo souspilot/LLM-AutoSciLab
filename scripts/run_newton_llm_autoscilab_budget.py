@@ -3,16 +3,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime
 from pathlib import Path
 from statistics import mean
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from run_paper_sweep import run_one as run_newton_one
+from run_paper_sweep import get_api_key, run_one as run_newton_one
+from autoscilab.benchmarking import (
+    atomic_write_json,
+    completed_result,
+    ensure_run_config,
+    file_sha256,
+    preflight_openai_endpoint,
+    safe_endpoint,
+)
 
 ROOT = Path(__file__).parent.parent
 DEFAULT_MANIFEST = ROOT / 'configs' / 'noise_studies' / 'newtonbench_llm_autoscilab_noise108.json'
@@ -66,16 +74,19 @@ def main() -> None:
     parser.add_argument('--manifest', type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument('--budgets', type=int, nargs='+', default=[10, 20, 50])
     parser.add_argument('--workers', type=int, default=8)
-    parser.add_argument('--model', default='gpt-4o-mini')
-    parser.add_argument('--main-url', default=None)
+    parser.add_argument('--model', default=os.environ.get('OPENAI_MODEL', 'gpt-4o-mini'))
+    parser.add_argument('--main-url', default=os.environ.get('OPENAI_BASE_URL'))
     parser.add_argument('--pysr-iters', type=int, default=800)
     parser.add_argument('--limit', type=int, default=None)
     parser.add_argument('--out-dir', type=Path, default=None)
+    parser.add_argument('--skip-preflight', action='store_true')
     args = parser.parse_args()
 
+    if args.main_url and not args.skip_preflight:
+        preflight_openai_endpoint(args.main_url, args.model, get_api_key(args.model, args.main_url))
+
     tasks = _load_manifest(args.manifest, args.limit)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    out_dir = args.out_dir or ROOT / 'results' / f'newton_llm_autoscilab_budget_{timestamp}'
+    out_dir = args.out_dir or ROOT / 'results' / 'paper_release_runs' / 'newton'
     out_dir.mkdir(parents=True, exist_ok=True)
 
     all_rows: list[dict] = []
@@ -86,10 +97,37 @@ def main() -> None:
     for budget in args.budgets:
         budget_dir = out_dir / f'b{budget}'
         budget_dir.mkdir(parents=True, exist_ok=True)
-        rows: list[dict] = []
         max_per_iter = max(1, budget // 5)
         eq_every = max_per_iter
-        print(f'[NewtonBudget] budget={budget} -> {budget_dir}')
+        fingerprint = ensure_run_config(
+            budget_dir,
+            {
+                'benchmark': 'newtonbench',
+                'method': 'llm_autoscilab_newton',
+                'model': args.model,
+                'main_url': safe_endpoint(args.main_url),
+                'manifest_sha256': file_sha256(args.manifest),
+                'budget': budget,
+                'noise': 0.0,
+                'max_per_iter': max_per_iter,
+                'eq_every': eq_every,
+                'pysr_iters': args.pysr_iters,
+            },
+        )
+        result_files = {
+            task['id']: budget_dir / 'tasks' / task['id'] / 'result.json'
+            for task in tasks
+        }
+        raw_rows = {
+            task['id']: prior
+            for task in tasks
+            if (prior := completed_result(result_files[task['id']], fingerprint)) is not None
+        }
+        pending = [task for task in tasks if task['id'] not in raw_rows]
+        print(
+            f'[NewtonBudget] budget={budget} -> {budget_dir} '
+            f'(resumed={len(raw_rows)} pending={len(pending)})'
+        )
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             futures = {
                 pool.submit(
@@ -104,10 +142,12 @@ def main() -> None:
                     eq_every,
                     0.0,
                     args.pysr_iters,
-                    budget_dir,
+                    budget_dir / 'tasks' / task['id'],
                     args.main_url,
+                    result_files[task['id']],
+                    fingerprint,
                 ): task
-                for task in tasks
+                for task in pending
             }
             for fut in as_completed(futures):
                 task = futures[fut]
@@ -119,15 +159,22 @@ def main() -> None:
                         'oracle_calls': 0, 'llm_calls': 0, 'duration_s': 0,
                         'best_equation': None, 'law_str': None,
                         'error': f'{type(exc).__name__}: {exc}\n{traceback.format_exc()}', 'result_dir': None,
+                        'run_fingerprint': fingerprint,
                     }
+                    atomic_write_json(result_files[task['id']], raw)
+                raw_rows[task['id']] = raw
+                rows = [_normalize(raw_rows[t['id']], t, budget) for t in tasks if t['id'] in raw_rows]
+                rows.sort(key=lambda r: (r['domain'], r['difficulty'], r['law_version'], r['seed']))
+                atomic_write_json(budget_dir / 'summary.json', rows)
+                atomic_write_json(budget_dir / 'aggregate.json', _aggregate(rows))
                 row = _normalize(raw, task, budget)
-                rows.append(row)
                 print(f"[NewtonBudget] {task['id']} budget={budget}: {row['status']}")
+        rows = [_normalize(raw_rows[t['id']], t, budget) for t in tasks if t['id'] in raw_rows]
         rows.sort(key=lambda r: (r['domain'], r['difficulty'], r['law_version'], r['seed']))
-        (budget_dir / 'summary.json').write_text(json.dumps(rows, indent=2, default=str))
+        atomic_write_json(budget_dir / 'summary.json', rows)
         agg = _aggregate(rows)
         by_budget[str(budget)] = agg
-        (budget_dir / 'aggregate.json').write_text(json.dumps(agg, indent=2))
+        atomic_write_json(budget_dir / 'aggregate.json', agg)
         all_rows.extend(rows)
 
     root_summary = {
@@ -135,8 +182,8 @@ def main() -> None:
         'manifest': str(args.manifest), 'budgets': args.budgets, 'workers': args.workers,
         'by_budget': by_budget,
     }
-    (out_dir / 'summary.json').write_text(json.dumps(all_rows, indent=2, default=str))
-    (out_dir / 'aggregate.json').write_text(json.dumps(root_summary, indent=2))
+    atomic_write_json(out_dir / 'summary.json', all_rows)
+    atomic_write_json(out_dir / 'aggregate.json', root_summary)
     print(f'[NewtonBudget] wrote {out_dir}')
 
 

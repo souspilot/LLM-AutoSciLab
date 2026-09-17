@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime
 from pathlib import Path
 from statistics import mean
 
@@ -14,6 +14,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
 from run_chembench_comparison import run_llm_pipeline
+from autoscilab.benchmarking import (
+    atomic_write_json,
+    completed_result,
+    ensure_run_config,
+    file_sha256,
+    preflight_openai_endpoint,
+    safe_endpoint,
+)
 
 ROOT = Path(__file__).parent.parent
 DEFAULT_MANIFEST = ROOT / 'configs' / 'noise_studies' / 'chembench_llm_autoscilab_noise27.json'
@@ -24,8 +32,14 @@ def _load_manifest(path: Path, limit: int | None = None) -> list[dict]:
     return rows[:limit] if limit is not None else rows
 
 
-def _run_one(task: dict, budget: int, args: argparse.Namespace, out_dir: Path) -> dict:
-    load_dotenv(override=True)
+def _run_one(
+    task: dict,
+    budget: int,
+    args: argparse.Namespace,
+    out_dir: Path,
+    run_fingerprint: str,
+) -> dict:
+    load_dotenv(override=False)
     run_dir = out_dir / task['id']
     try:
         result = run_llm_pipeline(
@@ -41,6 +55,8 @@ def _run_one(task: dict, budget: int, args: argparse.Namespace, out_dir: Path) -
             confidence_threshold=1.1, results_dir=run_dir,
             max_experiments_per_iter=args.max_per_iter,
         )
+        if result.get('error'):
+            raise RuntimeError(str(result['error']))
         row = {
             'task_id': task['id'], 'domain': task['domain'], 'difficulty': task['difficulty'],
             'law_version': task['law_version'], 'budget': budget, 'noise': 0.0,
@@ -50,6 +66,7 @@ def _run_one(task: dict, budget: int, args: argparse.Namespace, out_dir: Path) -
             'duration_s': result.get('duration_s'), 'equation': result.get('equation'),
             'termination': result.get('termination'), 'consultant_calls': result.get('consultant_calls'),
             'max_points_per_iter': args.max_per_iter,
+            'run_fingerprint': run_fingerprint,
         }
     except Exception as exc:
         row = {
@@ -60,10 +77,12 @@ def _run_one(task: dict, budget: int, args: argparse.Namespace, out_dir: Path) -
             'termination': None, 'consultant_calls': 0,
             'error': f'{type(exc).__name__}: {exc}\n{traceback.format_exc()}',
             'max_points_per_iter': args.max_per_iter,
+            'run_fingerprint': run_fingerprint,
         }
     run_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(run_dir / 'result.json', row)
     target = 'error.json' if row['status'] == 'error' else 'summary.json'
-    (run_dir / target).write_text(json.dumps(row, indent=2, default=str))
+    atomic_write_json(run_dir / target, row)
     return row
 
 
@@ -83,18 +102,26 @@ def main() -> None:
     parser.add_argument('--manifest', type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument('--budgets', type=int, nargs='+', default=[40, 60, 80])
     parser.add_argument('--workers', type=int, default=8)
-    parser.add_argument('--main-model', default='gpt-4o-mini')
+    parser.add_argument('--main-model', default=os.environ.get('OPENAI_MODEL', 'gpt-4o-mini'))
     parser.add_argument('--max-per-iter', type=int, default=5)
-    parser.add_argument('--main-url', default=None)
+    parser.add_argument('--main-url', default=os.environ.get('OPENAI_BASE_URL'))
     parser.add_argument('--ensemble-model', default='Qwen/Qwen2.5-7B-Instruct')
     parser.add_argument('--ensemble-url', default='http://localhost:8001/v1')
     parser.add_argument('--limit', type=int, default=None)
     parser.add_argument('--out-dir', type=Path, default=None)
+    parser.add_argument('--skip-preflight', action='store_true')
     args = parser.parse_args()
 
+    if args.main_url and not args.skip_preflight:
+        api_key = (
+            os.environ.get('DEEPINFRA_API_KEY') or os.environ.get('OPENAI_API_KEY')
+            if 'deepinfra.com' in args.main_url.lower()
+            else os.environ.get('OPENAI_API_KEY', 'local')
+        )
+        preflight_openai_endpoint(args.main_url, args.main_model, api_key or 'local')
+
     tasks = _load_manifest(args.manifest, args.limit)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    out_dir = args.out_dir or ROOT / 'results' / f'chembench_llm_autoscilab_budget_{timestamp}'
+    out_dir = args.out_dir or ROOT / 'results' / 'paper_release_runs' / 'chem'
     out_dir.mkdir(parents=True, exist_ok=True)
 
     all_rows = []
@@ -103,10 +130,38 @@ def main() -> None:
     for budget in args.budgets:
         budget_dir = out_dir / f'b{budget}'
         budget_dir.mkdir(parents=True, exist_ok=True)
-        rows = []
-        print(f'[ChemBudget] budget={budget} -> {budget_dir}')
+        fingerprint = ensure_run_config(
+            budget_dir,
+            {
+                'benchmark': 'chembench',
+                'method': 'mei_v5',
+                'model': args.main_model,
+                'main_url': safe_endpoint(args.main_url),
+                'manifest_sha256': file_sha256(args.manifest),
+                'budget': budget,
+                'noise': 0.0,
+                'max_per_iter': args.max_per_iter,
+                'max_completion_tokens': 4096,
+                'use_domain_tags': False,
+                'hypothesis_grammar_source': 'universal',
+            },
+        )
+        result_files = {task['id']: budget_dir / task['id'] / 'result.json' for task in tasks}
+        rows_by_id = {
+            task['id']: prior
+            for task in tasks
+            if (prior := completed_result(result_files[task['id']], fingerprint)) is not None
+        }
+        pending = [task for task in tasks if task['id'] not in rows_by_id]
+        print(
+            f'[ChemBudget] budget={budget} -> {budget_dir} '
+            f'(resumed={len(rows_by_id)} pending={len(pending)})'
+        )
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(_run_one, task, budget, args, budget_dir): task for task in tasks}
+            futures = {
+                pool.submit(_run_one, task, budget, args, budget_dir, fingerprint): task
+                for task in pending
+            }
             for fut in as_completed(futures):
                 task = futures[fut]
                 try:
@@ -119,18 +174,27 @@ def main() -> None:
                         'method': 'mei_v5', 'status': 'error', 'gt_rmsle': None, 'exact_accuracy': 0.0,
                         'n_experiments': 0, 'n_llm_calls': 0, 'duration_s': 0.0, 'equation': None,
                         'termination': None, 'consultant_calls': 0, 'error': f'{type(exc).__name__}: {exc}\n{tb}',
+                        'run_fingerprint': fingerprint,
                     }
                     err_dir = budget_dir / task['id']
                     err_dir.mkdir(parents=True, exist_ok=True)
-                    (err_dir / 'error.json').write_text(json.dumps(row, indent=2))
-                rows.append(row)
+                    atomic_write_json(err_dir / 'error.json', row)
+                    atomic_write_json(err_dir / 'result.json', row)
+                rows_by_id[task['id']] = row
+                rows = list(rows_by_id.values())
+                rows.sort(key=lambda r: (r['domain'], r['difficulty'], r['law_version']))
+                atomic_write_json(budget_dir / 'summary.json', rows)
+                current_agg = _aggregate([r for r in rows if r.get('status') != 'error'])
+                current_agg['n_errors'] = sum(r.get('status') == 'error' for r in rows)
+                atomic_write_json(budget_dir / 'aggregate.json', current_agg)
                 print(f"[ChemBudget] {task['id']} budget={budget}: {row['status']}")
+        rows = list(rows_by_id.values())
         rows.sort(key=lambda r: (r['domain'], r['difficulty'], r['law_version']))
-        (budget_dir / 'summary.json').write_text(json.dumps(rows, indent=2, default=str))
+        atomic_write_json(budget_dir / 'summary.json', rows)
         agg = _aggregate([r for r in rows if r.get('status') != 'error'])
         agg['n_errors'] = sum(r.get('status') == 'error' for r in rows)
         by_budget[str(budget)] = agg
-        (budget_dir / 'aggregate.json').write_text(json.dumps(agg, indent=2))
+        atomic_write_json(budget_dir / 'aggregate.json', agg)
         all_rows.extend(rows)
 
     root_summary = {
@@ -138,8 +202,8 @@ def main() -> None:
         'manifest': str(args.manifest), 'budgets': args.budgets, 'workers': args.workers,
         'by_budget': by_budget,
     }
-    (out_dir / 'summary.json').write_text(json.dumps(all_rows, indent=2, default=str))
-    (out_dir / 'aggregate.json').write_text(json.dumps(root_summary, indent=2))
+    atomic_write_json(out_dir / 'summary.json', all_rows)
+    atomic_write_json(out_dir / 'aggregate.json', root_summary)
     print(f'[ChemBudget] wrote {out_dir}')
 
 

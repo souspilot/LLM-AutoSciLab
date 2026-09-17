@@ -100,6 +100,7 @@ class GRNMEIGraphConfig:
     max_llm_retry_attempts: int = 3
     experiment_mode: str = "baseline"
     results_dir: Path = Path("results/")
+    llm_cache_path: Path | None = None
     seed: int = 0
 
 
@@ -398,6 +399,7 @@ class GRNMEIGraphLoop:
             api_key=api_key,
             base_url=base_url,
             max_completion_tokens=config.max_completion_tokens,
+            cache_path=config.llm_cache_path,
         )
         self._rng = np.random.default_rng(config.seed)
         self._llm_calls = 0

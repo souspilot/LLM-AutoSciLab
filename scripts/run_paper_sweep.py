@@ -21,7 +21,6 @@ import sys
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime
 from pathlib import Path
 
 # Cap all threading libraries to 1 thread per worker so that N parallel
@@ -34,6 +33,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from autoscilab.loop.discovery import DiscoveryConfig, DiscoveryLoop
 from autoscilab.oracle.newtonbench import NewtonBenchOracle
+from autoscilab.benchmarking import (
+    atomic_write_json,
+    completed_result,
+    ensure_run_config,
+    preflight_openai_endpoint,
+    safe_endpoint,
+    stable_seed,
+)
 
 # ── Domains ───────────────────────────────────────────────────────────────────
 
@@ -67,6 +74,9 @@ def get_api_key(model: str, base_url: str | None = None) -> str:
         if not key:
             raise ValueError("DEEPINFRA_API_KEY not set for DeepInfra model")
         return key
+    if base_url:
+        # Local OpenAI-compatible servers commonly accept any non-empty key.
+        return os.environ.get("OPENAI_API_KEY", "") or "local"
     if is_openai_model(model):
         key = os.environ.get("OPENAI_API_KEY", "")
         if not key:
@@ -105,6 +115,8 @@ def run_one(
     pysr_n_iterations: int,
     out_dir: Path,
     main_url: str | None = None,
+    result_file: Path | None = None,
+    run_fingerprint: str | None = None,
 ) -> dict:
     # Cap threading BEFORE any imports — env vars set in the parent process do
     # NOT propagate through ProcessPoolExecutor on macOS (spawn start method).
@@ -117,11 +129,11 @@ def run_one(
     import numpy as np
     try:
         from dotenv import load_dotenv
-        load_dotenv()
+        load_dotenv(override=False)
     except ImportError:
         pass
 
-    rng_seed = seed * 1000 + hash(domain + difficulty + version) % 10000
+    rng_seed = stable_seed(domain, difficulty, version, seed)
     random.seed(rng_seed)
     np.random.seed(rng_seed)
 
@@ -154,13 +166,14 @@ def run_one(
             strict_generator_discriminator_loop=True,
             mid_run_gt_eval=True,
             results_dir=out_dir,
+            llm_cache_path=out_dir / "llm_responses.json",
         )
 
         api_key = get_api_key(model, main_url)
         loop = DiscoveryLoop(cfg, api_key=api_key, base_url=main_url, oracle=oracle)
         result = loop.run()
 
-        return {
+        row = {
             "domain": domain,
             "difficulty": difficulty,
             "version": version,
@@ -181,7 +194,7 @@ def run_one(
             "error": None,
         }
     except Exception:
-        return {
+        row = {
             "domain": domain,
             "difficulty": difficulty,
             "version": version,
@@ -198,6 +211,11 @@ def run_one(
             "best_equation": None,
             "error": traceback.format_exc(),
         }
+    if run_fingerprint is not None:
+        row["run_fingerprint"] = run_fingerprint
+    if result_file is not None:
+        atomic_write_json(result_file, row)
+    return row
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
 
@@ -216,7 +234,7 @@ def load_checkpoint(checkpoint_file: Path):
         return set(), []
 
 def save_checkpoint(results: list, checkpoint_file: Path):
-    checkpoint_file.write_text(json.dumps(results, indent=2, default=str))
+    atomic_write_json(checkpoint_file, results)
 
 # ── Aggregate stats ───────────────────────────────────────────────────────────
 
@@ -250,7 +268,7 @@ def print_stats(results: list, domains: list):
 
 def main():
     parser = argparse.ArgumentParser(description="Paper sweep for one (model, budget) config.")
-    parser.add_argument("--model",   required=True,
+    parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL"),
                         help="Model identifier, e.g. gpt-4o-mini or meta-llama/Llama-3.3-8B-Instruct-Turbo")
     parser.add_argument("--budget",  type=int, required=True,
                         help="Total oracle-call budget (20, 60, or 100)")
@@ -265,8 +283,17 @@ def main():
     parser.add_argument("--seeds",   type=int, nargs="+", default=SEEDS)
     parser.add_argument("--domains", nargs="+", default=ALL_DOMAINS)
     parser.add_argument("--out-dir", type=Path, default=None,
-                        help="Output directory (auto-named if not set)")
+                        help="Output directory (stable/resumable if not set)")
+    parser.add_argument("--main-url", default=os.environ.get("OPENAI_BASE_URL"),
+                        help="OpenAI-compatible endpoint (default: OPENAI_BASE_URL)")
+    parser.add_argument("--skip-preflight", action="store_true")
     args = parser.parse_args()
+
+    if not args.model:
+        parser.error("--model is required when OPENAI_MODEL is not set")
+
+    if args.main_url and not args.skip_preflight:
+        preflight_openai_endpoint(args.main_url, args.model, get_api_key(args.model, args.main_url))
 
     # Derive max_per_iter and eq_every from budget and 5 LLM calls
     n_llm_calls  = 5
@@ -277,10 +304,23 @@ def main():
         parser.error(f"budget={args.budget} too small for {n_llm_calls} LLM calls")
 
     model_short = short_model_name(args.model)
-    timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir     = args.out_dir or Path(f"results/paper_sweep_{model_short}_b{args.budget}_{timestamp}")
+    out_dir     = args.out_dir or Path(f"results/paper_sweep_{model_short}_b{args.budget}")
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_file = out_dir / "checkpoint.json"
+    run_fingerprint = ensure_run_config(
+        out_dir,
+        {
+            "benchmark": "newtonbench",
+            "method": "llm_autoscilab_newton",
+            "model": args.model,
+            "main_url": safe_endpoint(args.main_url),
+            "budget": args.budget,
+            "noise": args.noise,
+            "max_per_iter": max_per_iter,
+            "eq_every": eq_every,
+            "pysr_iters": args.pysr_iters,
+        },
+    )
 
     # Build task list
     all_tasks = [
@@ -303,7 +343,22 @@ def main():
     print(f"  Output     : {out_dir}")
     print()
 
-    completed, all_results = load_checkpoint(checkpoint_file)
+    result_files = {
+        task: out_dir / "tasks" / f"{task[0]}__{task[1]}__{task[2]}__seed{task[3]}" / "result.json"
+        for task in all_tasks
+    }
+    recovered = {
+        task: row
+        for task in all_tasks
+        if (row := completed_result(result_files[task], run_fingerprint)) is not None
+    }
+    _legacy_completed, legacy_results = load_checkpoint(checkpoint_file)
+    for row in legacy_results:
+        task = (row.get("domain"), row.get("difficulty"), row.get("version"), row.get("seed"))
+        if task in all_tasks and task not in recovered and row.get("status") not in (None, "error"):
+            recovered[task] = row
+    completed = set(recovered)
+    all_results = list(recovered.values())
     pending = [t for t in all_tasks if t not in completed]
     print(f"  Completed  : {len(completed)}  |  Pending: {len(pending)}")
     print()
@@ -322,7 +377,11 @@ def main():
                 run_one,
                 domain, diff, ver, seed,
                 args.model, args.budget, max_per_iter, eq_every,
-                args.noise, args.pysr_iters, out_dir,
+                args.noise, args.pysr_iters,
+                out_dir / "tasks" / f"{domain}__{diff}__{ver}__seed{seed}",
+                args.main_url,
+                result_files[(domain, diff, ver, seed)],
+                run_fingerprint,
             ): (domain, diff, ver, seed)
             for domain, diff, ver, seed in pending
         }
@@ -338,7 +397,9 @@ def main():
                     "status": "error", "gt_rmsle": None, "exact_accuracy": None,
                     "oracle_calls": 0, "llm_calls": 0, "duration_s": 0,
                     "best_equation": None, "error": str(e),
+                    "run_fingerprint": run_fingerprint,
                 }
+                atomic_write_json(result_files[(domain, diff, ver, seed)], result)
 
             all_results.append(result)
             save_checkpoint(all_results, checkpoint_file)

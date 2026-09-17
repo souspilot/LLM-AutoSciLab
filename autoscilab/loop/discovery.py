@@ -148,6 +148,7 @@ class DiscoveryConfig:
     strong_model: str | None = None          # e.g. "gpt-4o"; None = disabled
     strong_model_calls: int  = 3             # hard cap per run
     results_dir: Path = Path("results/")
+    llm_cache_path: Path | None = None        # task-local completion replay cache
     # ── Confidence mode ──────────────────────────────────────────────────────
     confidence_mode: str = "bootstrap"   # "bootstrap" | "llm" | "both"
     llm_confidence_samples: int = 3      # LLM samples per confidence estimate (mode=llm/both)
@@ -328,6 +329,7 @@ class DiscoveryLoop:
             base_url=base_url,
             max_completion_tokens=config.max_completion_tokens,
             temperature=config.llm_temperature,
+            cache_path=config.llm_cache_path,
         )
         self._agent = LLMAgent(self._llm_client, self._oracle, memory=self._memory)
 

@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 from statistics import mean
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from autoscilab.benchmarking import atomic_write_json
 
 ROOT = Path(__file__).parent.parent
 DEFAULT_EXAMPLES = ROOT / 'configs' / 'noise_studies' / 'grnbench_prompt_noise18.json'
@@ -44,16 +48,16 @@ def main() -> None:
     parser.add_argument('--examples-file', type=Path, default=DEFAULT_EXAMPLES)
     parser.add_argument('--budgets', type=int, nargs='+', default=[10, 20, 50])
     parser.add_argument('--workers', type=int, default=8)
-    parser.add_argument('--main-model', default='gpt-4o-mini')
-    parser.add_argument('--main-url', default=None)
+    parser.add_argument('--main-model', default=os.environ.get('OPENAI_MODEL', 'gpt-4o-mini'))
+    parser.add_argument('--main-url', default=os.environ.get('OPENAI_BASE_URL'))
     parser.add_argument('--max-per-iter', type=int, default=5)
     parser.add_argument('--limit', type=int, default=None)
     parser.add_argument('--out-dir', type=Path, default=None)
+    parser.add_argument('--skip-preflight', action='store_true')
     args = parser.parse_args()
 
     examples = _load_examples(args.examples_file, args.limit)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    out_dir = args.out_dir or ROOT / 'results' / f'grn_prompt_budget_{timestamp}'
+    out_dir = args.out_dir or ROOT / 'results' / 'paper_release_runs' / 'grn'
     out_dir.mkdir(parents=True, exist_ok=True)
 
     all_rows = []
@@ -70,6 +74,10 @@ def main() -> None:
         ]
         if args.main_url:
             cmd.extend(['--main-url', args.main_url])
+        if args.limit is not None:
+            cmd.extend(['--limit', str(args.limit)])
+        if args.skip_preflight:
+            cmd.append('--skip-preflight')
         print(f'[GRNBudget] budget={budget} -> {budget_dir}')
         subprocess.run(cmd, cwd=str(ROOT), check=True)
         rows = json.loads((budget_dir / 'summary.json').read_text())
@@ -77,10 +85,10 @@ def main() -> None:
             row['budget'] = budget
             row['noise'] = 0.0
             row['method'] = 'llm_autoscilab_grn'
-        (budget_dir / 'summary.json').write_text(json.dumps(rows, indent=2))
+        atomic_write_json(budget_dir / 'summary.json', rows)
         agg = _aggregate(rows)
         by_budget[str(budget)] = agg
-        (budget_dir / 'aggregate.json').write_text(json.dumps(agg, indent=2))
+        atomic_write_json(budget_dir / 'aggregate.json', agg)
         all_rows.extend(rows)
 
     root_summary = {
@@ -88,8 +96,8 @@ def main() -> None:
         'manifest': str(args.examples_file), 'budgets': args.budgets, 'workers': args.workers,
         'by_budget': by_budget,
     }
-    (out_dir / 'summary.json').write_text(json.dumps(all_rows, indent=2))
-    (out_dir / 'aggregate.json').write_text(json.dumps(root_summary, indent=2))
+    atomic_write_json(out_dir / 'summary.json', all_rows)
+    atomic_write_json(out_dir / 'aggregate.json', root_summary)
     print(f'[GRNBudget] wrote {out_dir}')
 
 
